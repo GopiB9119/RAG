@@ -1,0 +1,4 @@
+# Approved, publicly accessible URLs. One per line.
+# Lines beginning with # are ignored. Linked .pdf files are found automatically.
+
+https://www.olaelectric.com/investor-relations/financials
