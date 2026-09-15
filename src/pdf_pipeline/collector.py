@@ -32,7 +32,8 @@ def collect_results(
     failed_results = [result for result in ordered_results if not result.success]
     pages = [{"job_id": result.job_id, "document_id": result.document_id,
               "page_index": result.page_index, "page_number": result.page_index + 1,
-              "text": result.text, "success": result.success, "error": result.error}
+              "text": result.text, "success": result.success, "error": result.error,
+              "extraction_method": result.extraction_method}
              for result in ordered_results]
 
     failed_pages = [result.page_index + 1 for result in failed_results]
@@ -43,6 +44,8 @@ def collect_results(
         "failed_pages_count": len(failed_results),
         "failed_pages": failed_pages,
         "status": "complete" if not failed_results else "incomplete",
+        "extraction_methods": {method: sum(result.extraction_method == method for result in successful_results)
+                       for method in ("native", "ocr", "blank")},
         "output_files": {
             "document_text": str(document_text_path),
             "pages_jsonl": str(pages_jsonl_path),

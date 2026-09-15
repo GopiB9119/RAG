@@ -2,12 +2,13 @@ import multiprocessing as mp
 import math
 import re
 import time
+from dataclasses import replace
 from pathlib import Path
 from queue import Empty
 
 from .collector import collect_results
 from .checkpoints import RangeCheckpoints, pdf_fingerprint, validate_range_result
-from .models import PageResult, PageRangeResult
+from .models import ExtractionOptions, PageResult, PageRangeResult
 from .scheduler import create_page_jobs, create_page_range_jobs
 from .worker import worker_loop
 
@@ -22,6 +23,7 @@ def run_pipeline(
     pages_per_task: int = 1,
     checkpoint_root: str | None = None,
     write_outputs: bool = True,
+    extraction: ExtractionOptions | None = None,
 ) -> dict:
     if workers < 1:
         raise ValueError("workers must be at least 1")
@@ -31,6 +33,9 @@ def run_pipeline(
         raise ValueError("document_id must contain only letters, numbers, underscores or hyphens")
     if pages_per_task < 1:
         raise ValueError("pages_per_task must be at least 1")
+    extraction = extraction or ExtractionOptions()
+    if not isinstance(extraction, ExtractionOptions):
+        raise ValueError("extraction must be ExtractionOptions")
 
     pdf_file = Path(pdf_path).resolve()
     if not pdf_file.exists():
@@ -38,11 +43,12 @@ def run_pipeline(
 
     range_mode = pages_per_task > 1 or checkpoint_root is not None
     initial_stat = pdf_file.stat()
-    checkpoints = RangeCheckpoints(Path(checkpoint_root), document_id, pdf_fingerprint(pdf_file), pages_per_task) if checkpoint_root else None
+    checkpoints = RangeCheckpoints(Path(checkpoint_root), document_id, pdf_fingerprint(pdf_file), pages_per_task, extraction) if checkpoint_root else None
     jobs = (create_page_range_jobs(str(pdf_file), document_id, pages_per_task) if range_mode
             else create_page_jobs(pdf_path=str(pdf_file), document_id=document_id))
     if not jobs:
         raise ValueError("The PDF contains no pages.")
+    jobs = [replace(job, extraction=extraction) for job in jobs]
     pending = []
     results: list[PageResult] = []
     reused_ranges = 0

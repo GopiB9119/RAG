@@ -7,7 +7,7 @@ import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
-from .models import PageRangeJob, PageRangeResult, PageResult
+from .models import EXTRACTION_VERSION, ExtractionOptions, PageRangeJob, PageRangeResult, PageResult
 
 
 def validate_range_result(job: PageRangeJob, result: PageRangeResult) -> None:
@@ -21,8 +21,15 @@ def validate_range_result(job: PageRangeJob, result: PageRangeResult) -> None:
                 or page.document_id != job.document_id or not isinstance(page.text, str)
                 or type(page.success) is not bool
                 or (page.error is not None and not isinstance(page.error, str))
-                or (page.success and page.error is not None)):
+                or (page.success and page.error is not None)
+                or page.extraction_method not in ("native", "ocr", "blank")):
             raise RuntimeError("Mismatched page in range result")
+        if page.success and (
+            (page.extraction_method == "blank") != (not page.text.strip())
+            or (page.extraction_method == "ocr" and job.extraction.ocr == "off")
+            or (page.extraction_method == "native" and job.extraction.ocr == "always")
+        ):
+            raise RuntimeError("Page extraction method does not match the policy or text")
 
 
 def pdf_fingerprint(path: Path) -> str:
@@ -40,11 +47,14 @@ class RangeCheckpoints:
         # after indexing. Hashing also keeps arbitrary path components out.
         return root / "by-pdf" / hashlib.sha256(fingerprint.encode()).hexdigest()
 
-    def __init__(self, root: Path, document_id: str, fingerprint: str, pages_per_task: int):
+    def __init__(self, root: Path, document_id: str, fingerprint: str, pages_per_task: int,
+                 extraction: ExtractionOptions | None = None):
         # Bump extraction_version when extraction semantics change. A different PDF,
         # document identity, or range size must never reuse this run's checkpoints.
-        identity = json.dumps({"extraction_version": 1, "document_id": document_id,
-                               "pdf_sha256": fingerprint, "pages_per_task": pages_per_task}, sort_keys=True)
+        self.extraction = extraction or ExtractionOptions()
+        identity = json.dumps({"extraction_version": EXTRACTION_VERSION, "document_id": document_id,
+                       "pdf_sha256": fingerprint, "pages_per_task": pages_per_task,
+                       "extraction": asdict(self.extraction)}, sort_keys=True)
         grouped = self.content_directory(root, fingerprint)
         self.identity = hashlib.sha256(identity.encode()).hexdigest()
         # Keep nested paths short on Windows; the full identity is checked inside
@@ -55,6 +65,8 @@ class RangeCheckpoints:
         self.directory.mkdir(parents=True, exist_ok=True)
 
     def path(self, job: PageRangeJob) -> Path:
+        if job.extraction != self.extraction:
+            raise ValueError("Checkpoint policy does not match the range job")
         return self.directory / f"{job.start_page:06d}-{job.end_page:06d}.json"
 
     def load(self, job: PageRangeJob) -> PageRangeResult | None:

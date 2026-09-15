@@ -19,18 +19,26 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from pdf_pipeline.job_store import JobStore
+from pdf_pipeline.models import ExtractionOptions
 
 
-def make_processor(database: Path, collection: str, workers: int, pages_per_task: int = 10) -> Callable:
-    # A closure keeps one embedding model alive across documents in this consumer.
-    # The PDF worker processes extract text; they do not each load the model.
-    model = None
+def emit_progress(event: dict) -> None:
+    payload = json.dumps(event)
+    try:
+        print(payload, flush=True)
+    except (OSError, ValueError):
+        # Closed output is not a processing failure; durable state is authoritative.
+        pass
 
-    def process(job: dict) -> int:
-        nonlocal model
-        from ingest_sources import load_pdf, chunk_records, build_index
-        from rag_core import MODEL_NAME
-        from sentence_transformers import SentenceTransformer
+
+def make_processor(database: Path, collection: str, workers: int, pages_per_task: int = 10,
+                   extraction: ExtractionOptions | None = None) -> Callable:
+    from ingest_sources import DocumentPublisher
+
+    publisher = DocumentPublisher(str(database), collection)
+
+    def process(job: dict) -> dict:
+        from ingest_sources import load_pdf
 
         snapshot = Path(job["snapshot"])
         # Check the exact saved bytes, not today's contents of the original file.
@@ -46,16 +54,15 @@ def make_processor(database: Path, collection: str, workers: int, pages_per_task
         # completed ranges for these exact PDF bytes; citations still use source.
         records = load_pdf(snapshot, source=job["source"], workers=workers,
                    pages_per_task=pages_per_task,
-                   checkpoint_root=str(snapshot.parent.parent / "checkpoints"))
-        chunks = chunk_records(records)
-        if model is None:
-            model = SentenceTransformer(MODEL_NAME)
-        return build_index(chunks, str(database.resolve()), collection, False, model=model)
+                   checkpoint_root=str(snapshot.parent.parent / "checkpoints"),
+                   extraction=extraction or ExtractionOptions())
+        return publisher.publish(records, job["id"])
 
     return process
 
 
-def process_due(store: JobStore, processor: Callable, limit: int, stop: Event | None = None) -> dict:
+def process_due(store: JobStore, processor: Callable, limit: int, stop: Event | None = None,
+                *, require_receipt: bool = False) -> dict:
     # Caller owns the consumer lock; the watcher keeps it between scan cycles too.
     summary = {"processed": 0, "ready": 0, "errors": 0}
     for _ in range(limit):
@@ -66,18 +73,26 @@ def process_due(store: JobStore, processor: Callable, limit: int, stop: Event | 
             break
         started = time.perf_counter()
         try:
-            chunk_count = processor(job)
-            if not isinstance(chunk_count, int) or chunk_count < 1:
+            outcome = processor(job)
+            receipt = outcome if isinstance(outcome, dict) else None
+            if require_receipt and receipt is None:
+                raise ValueError("Document publisher must return a committed receipt")
+            chunk_count = receipt.get("chunk_count") if receipt is not None else outcome
+            if type(chunk_count) is not int or chunk_count < 1:
                 raise ValueError("Indexing must return a positive chunk count")
-            # A crash after indexing but before ready causes safe at-least-once replay.
-            store.finish(job["id"], chunk_count)
+            if receipt is None:
+                store.finish(job["id"], chunk_count)
+            else:
+                # Same committed-receipt verifier as the Azure coordinator. Keep
+                # source-specific queue persistence in its adapter.
+                store.finish(job["id"], chunk_count, receipt=receipt)
             # Index success is durable before cleanup. A cleanup failure must not
             # turn a ready job back into queued work or repeat paid processing.
             try:
                 store.cleanup_ready_artifacts(job["id"])
             except Exception as cleanup_error:
-                print(json.dumps({"event": "cleanup_deferred", "job_id": job["id"],
-                                  "error_type": type(cleanup_error).__name__}), flush=True)
+                emit_progress({"event": "cleanup_deferred", "job_id": job["id"],
+                               "error_type": type(cleanup_error).__name__})
             summary["ready"] += 1
             event = {"event": "job_ready", "job_id": job["id"], "chunks": chunk_count}
         except Exception as error:
@@ -86,20 +101,23 @@ def process_due(store: JobStore, processor: Callable, limit: int, stop: Event | 
             event = {"event": "job_attempt_failed", "job_id": job["id"], "error_type": type(error).__name__}
         summary["processed"] += 1
         event.update(attempt=job["attempts"], seconds=round(time.perf_counter() - started, 3))
-        print(json.dumps(event), flush=True)
+        emit_progress(event)
     summary["states"] = store.counts()
     return summary
 
 
-def consume(store: JobStore, processor: Callable, database: Path, collection: str, limit: int = 100) -> dict:
+def consume(store: JobStore, processor: Callable, database: Path, collection: str, limit: int = 100,
+            *, extraction: ExtractionOptions | None = None, require_receipt: bool = False) -> dict:
     if limit < 1:
         raise ValueError("limit must be positive")
     # This lock protects one local queue consumer, not all writers on all machines.
     # Recovery is safe only after the previous consumer no longer holds the lock.
     with store.consumer_lock():
+        if extraction is not None:
+            store.bind_extraction(extraction)
         store.bind_target(database, collection)
         recovered = store.recover_interrupted()
-        summary = process_due(store, processor, limit)
+        summary = process_due(store, processor, limit, require_receipt=require_receipt)
         summary["recovered"] = recovered
     return summary
 
@@ -107,7 +125,8 @@ def consume(store: JobStore, processor: Callable, database: Path, collection: st
 def watch(store: JobStore, processor: Callable, folder: Path, database: Path,
           collection: str, poll_seconds: float = 2, stable_seconds: float = 10,
           limit: int = 1, max_bytes: int = 100 * 1024 * 1024,
-          max_attempts: int = 3, stop: Event | None = None) -> None:
+          max_attempts: int = 3, stop: Event | None = None,
+          extraction: ExtractionOptions | None = None, require_receipt: bool = False) -> None:
     from pdf_pipeline.watcher import FolderScanner
 
     if not math.isfinite(poll_seconds) or poll_seconds <= 0 or limit < 1:
@@ -117,13 +136,15 @@ def watch(store: JobStore, processor: Callable, folder: Path, database: Path,
     scanner = FolderScanner(folder, store, stable_seconds, max_bytes, max_attempts)
     stop = stop if stop is not None else Event()
     with store.consumer_lock():
+        if extraction is not None:
+            store.bind_extraction(extraction)
         store.bind_target(database, collection)
         recovered = store.recover_interrupted()
         print(json.dumps({"event": "watch_started", "recovered": recovered}), flush=True)
         try:
             while not stop.is_set():
                 scanner.scan()
-                result = process_due(store, processor, limit, stop)
+                result = process_due(store, processor, limit, stop, require_receipt=require_receipt)
                 if result["processed"]:
                     print(json.dumps({"event": "watch_progress", **result}), flush=True)
                 # Event.wait is interruptible; tests inject a controlled event so
@@ -146,6 +167,7 @@ def main() -> int:
     work = commands.add_parser("work", help="Process due jobs, then exit; rerun for delayed retries")
     work.add_argument("--workers", type=int, default=4)
     work.add_argument("--pages-per-task", type=int, default=10)
+    ExtractionOptions.add_arguments(work)
     work.add_argument("--limit", type=int, default=100)
     work.add_argument("--database", type=Path, default=PROJECT_ROOT / "chroma_data")
     work.add_argument("--collection", default="rag_documents")
@@ -153,6 +175,7 @@ def main() -> int:
     watcher.add_argument("path", type=Path, nargs="?", default=PROJECT_ROOT / "data" / "input")
     watcher.add_argument("--workers", type=int, default=2)
     watcher.add_argument("--pages-per-task", type=int, default=10)
+    ExtractionOptions.add_arguments(watcher)
     watcher.add_argument("--limit", type=int, default=1, help="Documents processed between folder scans")
     watcher.add_argument("--poll-seconds", type=float, default=2)
     watcher.add_argument("--stable-seconds", type=float, default=10)
@@ -175,6 +198,10 @@ def main() -> int:
             if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
                 parser.error(f"--{name.replace('_', '-')} must be finite and positive")
     if args.command in ("work", "watch"):
+        try:
+            extraction = ExtractionOptions.from_namespace(args)
+        except ValueError as error:
+            parser.error(str(error))
         # Fail before claiming work: missing packages must not consume retry attempts.
         missing = [name for name in ("pymupdf", "chromadb", "sentence_transformers")
                    if importlib.util.find_spec(name) is None]
@@ -183,9 +210,9 @@ def main() -> int:
             return 2
     store = JobStore(args.state_dir)
     if args.command == "watch":
-        watch(store, make_processor(args.database, args.collection, args.workers, args.pages_per_task),
+        watch(store, make_processor(args.database, args.collection, args.workers, args.pages_per_task, extraction),
               args.path, args.database, args.collection, args.poll_seconds, args.stable_seconds,
-              args.limit, args.max_mb * 1024 * 1024, args.max_attempts)
+              args.limit, args.max_mb * 1024 * 1024, args.max_attempts, extraction=extraction, require_receipt=True)
         return 0
     if args.command == "enqueue":
         source = args.path.resolve(strict=True)
@@ -205,15 +232,16 @@ def main() -> int:
     if args.command == "status":
         fields = ("id", "state", "attempts", "max_attempts", "created_at", "updated_at", "available_at", "error_type", "chunk_count")
         print(json.dumps({"counts": store.counts(), "jobs": [
-            {field: job[field] for field in fields} for job in store.list_jobs(args.limit)
+            {**{field: job[field] for field in fields}, "has_publication_receipt": job["publication_receipt"] is not None}
+            for job in store.list_jobs(args.limit)
         ]}, indent=2))
         return 0
     if args.command == "retry":
         store.retry(args.job_id)
         print(json.dumps({"job_id": args.job_id, "state": "queued"}))
         return 0
-    result = consume(store, make_processor(args.database, args.collection, args.workers, args.pages_per_task),
-                     args.database, args.collection, args.limit)
+    result = consume(store, make_processor(args.database, args.collection, args.workers, args.pages_per_task, extraction),
+                     args.database, args.collection, args.limit, extraction=extraction, require_receipt=True)
     print(json.dumps(result))
     return 2 if result["errors"] or result["states"].get("failed", 0) else 0
 

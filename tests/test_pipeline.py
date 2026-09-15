@@ -194,7 +194,7 @@ def test_ingestion_cli_connects_pipeline_to_index(tmp_path, monkeypatch):
     assert calls[0]["workers"] == 2
     assert indexed == [{"text": "Revenue increased.", "metadata": {
         "source": str(pdf_path.resolve()), "title": "report.pdf",
-        "type": "pdf", "page": 1, "chunk": 0,
+        "type": "pdf", "page": 1, "chunk": 0, "extraction_method": "native",
     }}]
 
 
@@ -299,7 +299,7 @@ def test_live_pdf_extraction_index_and_retrieval(tmp_path, monkeypatch):
     import chromadb
     from sentence_transformers import SentenceTransformer
     from ingest_sources import load_pdf, chunk_records, build_index
-    from rag_core import MODEL_NAME, retrieve, validate_collection
+    from rag_core import MODEL_NAME, retrieve, open_published_collection
 
     pdf_path = tmp_path / "synthetic-budget.pdf"
     with pymupdf.open() as document:
@@ -317,7 +317,7 @@ def test_live_pdf_extraction_index_and_retrieval(tmp_path, monkeypatch):
     assert build_index(chunks, database, "live_test", False) == len(chunks)
     client = chromadb.PersistentClient(path=database)
     collection = client.get_collection("live_test")
-    validate_collection(collection)
+    collection = open_published_collection(collection, database, "live_test")
     assert collection.count() == len(chunks)
     model = SentenceTransformer(MODEL_NAME)
     monkeypatch.setenv("RAG_TOP_K", "4")
@@ -443,6 +443,7 @@ def test_baseline_full_control_flow_with_service_doubles(tmp_path, monkeypatch, 
     monkeypatch.setattr(baseline, "create_fixture", fake_fixture)
     monkeypatch.setattr(ingest_sources, "load_pdf", fake_load_pdf)
     monkeypatch.setattr(ingest_sources, "build_index", fake_index)
+    monkeypatch.setattr(rag_core, "open_published_collection", lambda collection, *args: collection)
     monkeypatch.setattr(rag_core, "retrieve", lambda question, *args: [expected[question]])
     monkeypatch.setattr(rag_core, "generate_answer", fake_answer)
     for setting in rag_core.REQUIRED_AZURE_SETTINGS:
@@ -490,11 +491,18 @@ def test_range_extractor_opens_pdf_once_and_preserves_page_errors(monkeypatch):
     class FakePage:
         def __init__(self, number):
             self.number = number
+            from types import SimpleNamespace
 
-        def get_text(self, mode):
+            self.rect = SimpleNamespace(width=612, height=792, x0=0, y0=0, x1=612, y1=792)
+
+        def get_text(self, mode, *, sort):
+            assert sort is True
             if self.number == 2:
                 raise ValueError("Unusable page")
             return f"Page {self.number + 1}"
+
+        def get_image_info(self):
+            return []
 
     class FakeDocument:
         def __enter__(self):
@@ -517,6 +525,167 @@ def test_range_extractor_opens_pdf_once_and_preserves_page_errors(monkeypatch):
     assert [page.page_index for page in result.pages] == [1, 2, 3]
     assert [page.success for page in result.pages] == [True, False, True]
     assert result.pages[0].text == "Page 2"
+
+
+def test_shared_extraction_quality_and_ocr_routing(monkeypatch):
+    from types import ModuleType, SimpleNamespace
+    from pdf_pipeline.models import ExtractionOptions, PageJob, PageRangeJob
+    from pdf_pipeline.extractor import extract_page, extract_range
+
+    class Page:
+        rect = SimpleNamespace(width=612, height=792, x0=0, y0=0, x1=612, y1=792)
+
+        def __init__(self, text, visual=False, ocr_text="Recognized text."):
+            self.text, self.visual, self.ocr_text = text, visual, ocr_text
+            self.calls = []
+
+        def get_text(self, mode, *, sort, textpage=None):
+            assert mode == "text" and sort is True
+            return self.ocr_text if textpage is not None else self.text
+
+        def get_image_info(self):
+            return [{"bbox": (0, 0, 612, 792)}] if self.visual else []
+
+        def get_drawings(self):
+            return []
+
+        def get_textpage_ocr(self, **kwargs):
+            self.calls.append(kwargs)
+            return object()
+
+    pages = [Page("Native page."), Page(""), Page("", True), Page("4", True), Page("Bad\ufffdtext")]
+
+    class Document:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def __len__(self):
+            return len(pages)
+
+        def __getitem__(self, number):
+            return pages[number]
+
+    native = ModuleType("pymupdf")
+    native.open = lambda path: Document()
+    monkeypatch.setitem(sys.modules, "pymupdf", native)
+    off = extract_range(PageRangeJob("range", "doc", "input.pdf", 0, 5))
+    assert [page.success for page in off.pages] == [True, True, False, False, False]
+    assert [page.error for page in off.pages[2:]] == ["OCRRequired"] * 3
+    auto = extract_range(PageRangeJob("range", "doc", "input.pdf", 0, 5, ExtractionOptions(ocr="auto")))
+    assert all(page.success for page in auto.pages)
+    assert [page.extraction_method for page in auto.pages] == ["native", "blank", "ocr", "ocr", "ocr"]
+    assert pages[0].calls == [] and pages[1].calls == []
+    assert pages[2].calls == [{"language": "eng", "dpi": 300, "full": True}]
+    assert [page.page_index for page in auto.pages] == list(range(5))
+    single = extract_page(PageJob("custom-id", "doc", "input.pdf", 2, ExtractionOptions(ocr="auto")))
+    assert single.job_id == "custom-id" and single.text == auto.pages[2].text
+
+
+def test_ocr_pixel_budget_and_empty_output_fail_closed():
+    from types import SimpleNamespace
+    from pdf_pipeline.extractor import _page_text, OCRFailed, OCRResourceLimit
+    from pdf_pipeline.models import ExtractionOptions
+
+    calls = []
+    page = SimpleNamespace(
+        rect=SimpleNamespace(width=612, height=792, x0=0, y0=0, x1=612, y1=792),
+        get_text=lambda *args, **kwargs: "",
+        get_image_info=lambda: [{"bbox": (0, 0, 612, 792)}],
+        get_textpage_ocr=lambda **kwargs: calls.append(kwargs) or object(),
+    )
+    with pytest.raises(OCRResourceLimit):
+        _page_text(page, ExtractionOptions(ocr="auto", max_ocr_pixels=100))
+    assert calls == []
+    with pytest.raises(OCRFailed, match="no usable text"):
+        _page_text(page, ExtractionOptions(ocr="auto"))
+
+
+def test_vector_only_and_forced_ocr_pages_use_the_same_quality_gate():
+    from types import SimpleNamespace
+    from pdf_pipeline.extractor import _page_text, OCRFailed, OCRRequired
+    from pdf_pipeline.models import ExtractionOptions
+
+    calls = []
+    page = SimpleNamespace(
+        rect=SimpleNamespace(width=612, height=792, x0=0, y0=0, x1=612, y1=792),
+        get_text=lambda *args, **kwargs: "Recognized" if kwargs.get("textpage") else "",
+        get_image_info=lambda: [],
+        get_drawings=lambda: [{"type": "drawing"}],
+        get_textpage_ocr=lambda **kwargs: calls.append(kwargs) or object(),
+    )
+    with pytest.raises(OCRRequired):
+        _page_text(page, ExtractionOptions())
+    assert _page_text(page, ExtractionOptions(ocr="auto")) == ("Recognized", "ocr")
+    page.get_text = lambda *args, **kwargs: "OCR text" if kwargs.get("textpage") else "Native text"
+    assert _page_text(page, ExtractionOptions(ocr="auto")) == ("Native text", "native")
+    assert _page_text(page, ExtractionOptions(ocr="always")) == ("OCR text", "ocr")
+    assert len(calls) == 2
+
+    def unavailable(**kwargs):
+        raise RuntimeError("Private engine configuration details")
+
+    page.get_textpage_ocr = unavailable
+    with pytest.raises(OCRFailed, match="unavailable") as error:
+        _page_text(page, ExtractionOptions(ocr="always"))
+    assert "Private" not in str(error.value)
+
+
+def test_auto_ocr_can_recover_a_broken_native_text_layer():
+    from types import SimpleNamespace
+    from pdf_pipeline.extractor import _page_text
+    from pdf_pipeline.models import ExtractionOptions
+
+    def native_or_ocr_text(*args, **kwargs):
+        if kwargs.get("textpage") is not None:
+            return "Recovered text"
+        raise ValueError("Broken native font mapping")
+
+    page = SimpleNamespace(
+        rect=SimpleNamespace(width=612, height=792, x0=0, y0=0, x1=612, y1=792),
+        get_text=native_or_ocr_text, get_image_info=lambda: [],
+        get_textpage_ocr=lambda **kwargs: object(),
+    )
+    with pytest.raises(ValueError, match="font mapping"):
+        _page_text(page, ExtractionOptions())
+    assert _page_text(page, ExtractionOptions(ocr="auto")) == ("Recovered text", "ocr")
+
+
+def test_rag_rejects_unresolved_scan_and_keeps_ocr_provenance(tmp_path, monkeypatch):
+    from types import ModuleType
+    import ingest_sources
+    from pdf_pipeline.models import ExtractionOptions
+
+    pipeline = ModuleType("pdf_pipeline.main")
+    policy = ExtractionOptions(ocr="auto", language="eng+hin")
+
+    def checked_pipeline(**kwargs):
+        assert kwargs["extraction"] == policy
+        assert kwargs["write_outputs"] is False
+        return collect_results(kwargs["document_id"], [
+            PageResult("page:1", kwargs["document_id"], 0, "Recognized text.", True, extraction_method="ocr"),
+        ], write_outputs=False)
+
+    pipeline.run_pipeline = checked_pipeline
+    monkeypatch.setitem(sys.modules, "pdf_pipeline.main", pipeline)
+    records = ingest_sources.load_pdf(tmp_path / "scan.pdf", extraction=policy)
+    assert records[0]["metadata"]["extraction_method"] == "ocr"
+    assert ingest_sources.chunk_records(records)[0]["metadata"]["page"] == 1
+    pipeline.run_pipeline = lambda **kwargs: collect_results("rag-document", [
+        PageResult("page:1", "rag-document", 0, "", False, "OCRFailed"),
+    ], write_outputs=False)
+    with pytest.raises(RuntimeError, match="failed on pages"):
+        ingest_sources.load_pdf(tmp_path / "scan.pdf", extraction=policy)
+
+
+@pytest.mark.parametrize("options", [{"ocr": "guess"}, {"dpi": 0}, {"dpi": True}, {"language": "../eng"}])
+def test_invalid_extraction_policy_is_rejected(options):
+    from pdf_pipeline.models import ExtractionOptions
+
+    with pytest.raises(ValueError):
+        ExtractionOptions(**options)
 
 
 def range_result(job):
@@ -561,6 +730,38 @@ def test_failed_and_mismatched_ranges_are_not_checkpointed(tmp_path):
     result.pages[0].page_index = 99
     with pytest.raises(RuntimeError, match="Mismatched page"):
         checkpoints.save(job, result)
+
+
+def test_checkpoint_identity_includes_ocr_policy_and_methods(tmp_path):
+    from dataclasses import replace
+    from pdf_pipeline.checkpoints import RangeCheckpoints
+    from pdf_pipeline.models import ExtractionOptions
+    from pdf_pipeline.scheduler import split_page_ranges
+
+    native_job = split_page_ranges("pdf", "doc", 1)[0]
+    native = RangeCheckpoints(tmp_path, "doc", "content", 10)
+    native.save(native_job, range_result(native_job))
+    auto_policy = ExtractionOptions(ocr="auto", language="eng+hin")
+    auto_job = replace(native_job, extraction=auto_policy)
+    auto = RangeCheckpoints(tmp_path, "doc", "content", 10, auto_policy)
+    assert auto.load(auto_job) is None
+    assert native.directory != auto.directory
+    recognized = range_result(auto_job)
+    recognized.pages[0].extraction_method = "ocr"
+    auto.save(auto_job, recognized)
+    assert auto.load(auto_job) == recognized
+    with pytest.raises(ValueError, match="policy"):
+        native.save(auto_job, recognized)
+
+
+def test_collector_reports_extraction_provenance_without_exports(tmp_path):
+    results = [PageResult("doc:1", "doc", 0, "Text", True),
+               PageResult("doc:2", "doc", 1, "Recognized", True, extraction_method="ocr"),
+               PageResult("doc:3", "doc", 2, "", True, extraction_method="blank")]
+    summary = collect_results("doc", results, str(tmp_path), write_outputs=False)
+    assert summary["extraction_methods"] == {"native": 1, "ocr": 1, "blank": 1}
+    assert summary["pages"][1]["extraction_method"] == "ocr"
+    assert list(tmp_path.iterdir()) == []
 
 
 def successful_range_worker(job_queue, result_queue):

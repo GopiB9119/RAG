@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 
-from rag_core import DEFAULT_COLLECTION, DEFAULT_DATABASE, MODEL_NAME, answer_question, validate_collection
+from rag_core import DEFAULT_COLLECTION, DEFAULT_DATABASE, MODEL_NAME, answer_question, open_published_collection
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +28,10 @@ def load_collection(database: str, name: str):
         raise SystemExit(
             f"Collection '{name}' was not found. Run ingest_sources.py first."
         ) from error
+    collection = open_published_collection(collection, database, name)
     if not collection.count():
         raise SystemExit("The collection is empty. Run ingest_sources.py first.")
-    validate_collection(collection)
-    # Refuse unknown embedding settings rather than silently searching mismatched vectors.
+    # The view counts and searches only committed revisions, not staging vectors.
     return collection
 
 

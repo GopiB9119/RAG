@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import sqlite3
 import time
 from pathlib import Path
 
@@ -49,6 +50,14 @@ class FolderScanner:
                     continue
                 try:
                     job = self.store.enqueue(path, self.max_bytes, self.max_attempts)
+                except sqlite3.OperationalError as error:
+                    # Retry only lock contention. Do not mark the file submitted,
+                    # and do not hide corruption or other persistent database faults.
+                    code = getattr(error, "sqlite_errorcode", 0)
+                    if code & 0xFF not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                        raise
+                    print(json.dumps({"event": "watch_queue_busy"}), flush=True)
+                    continue
                 except ValueError as error:
                     # Reject this version once. A later file change makes it eligible
                     # again; exhausted extraction retries still require manual retry.

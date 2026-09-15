@@ -102,7 +102,11 @@ class RetrievalTests(unittest.TestCase):
         from sentence_transformers import SentenceTransformer
 
         client = chromadb.PersistentClient(path=DEFAULT_DATABASE)
-        cls.collection = client.get_or_create_collection(name=DEFAULT_COLLECTION)
+        from rag_core import open_published_collection
+
+        cls.collection = open_published_collection(
+            client.get_collection(name=DEFAULT_COLLECTION), DEFAULT_DATABASE, DEFAULT_COLLECTION,
+        )
         if not cls.collection.count():
             raise unittest.SkipTest(
                 f"Collection '{DEFAULT_COLLECTION}' is empty. Run ingest_sources.py first."

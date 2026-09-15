@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import time
+from threading import Event
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -17,6 +18,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from pdf_pipeline.distributed import MAX_PDF_BYTES, collect_records, dispatch, reconcile, load_manifest
+from pdf_pipeline.models import ExtractionOptions
 
 
 def dependency_missing(name: str) -> bool:
@@ -33,6 +35,7 @@ def main() -> int:
     submit.add_argument("pdf", type=Path)
     submit.add_argument("--document-id", required=True)
     submit.add_argument("--pages-per-task", type=int, default=10)
+    ExtractionOptions.add_arguments(submit)
     resume = commands.add_parser("reconcile", help="Resend range tasks with no valid stored result")
     resume.add_argument("version")
     worker = commands.add_parser("worker")
@@ -45,8 +48,35 @@ def main() -> int:
     collect.add_argument("--index", action="store_true", help="Write to ONE coordinator's local Chroma index")
     collect.add_argument("--database", default=str(ROOT / "chroma_data"))
     collect.add_argument("--collection", default="rag_documents")
+    coordinator = commands.add_parser("coordinate", help="Continuously discover Blob PDFs, dispatch ranges, and index completed documents")
+    coordinator.add_argument("--state-dir", type=Path, default=ROOT / "data" / "azure-coordinator")
+    coordinator.add_argument("--incoming-prefix", default="incoming/")
+    coordinator.add_argument("--pages-per-task", type=int, default=10)
+    ExtractionOptions.add_arguments(coordinator)
+    coordinator.add_argument("--poll-seconds", type=int, default=10)
+    coordinator.add_argument("--check-seconds", type=int, default=60)
+    coordinator.add_argument("--document-timeout", type=int, default=3600)
+    coordinator.add_argument("--max-attempts", type=int, default=5)
+    coordinator.add_argument("--scan-limit", type=int, default=100)
+    coordinator.add_argument("--work-limit", type=int, default=10)
+    coordinator.add_argument("--database", type=Path, default=ROOT / "chroma_data")
+    coordinator.add_argument("--collection", default="rag_documents")
+    coordinator.add_argument("--once", action="store_true")
+    coordinator_status = commands.add_parser("coordinate-status", help="Read local durable coordinator progress")
+    coordinator_status.add_argument("--state-dir", type=Path, default=ROOT / "data" / "azure-coordinator")
+    coordinator_status.add_argument("--history", action="store_true", help="Include recent generation transitions without document text or source paths")
+    coordinator_status.add_argument("--retirement-preview", action="store_true", help="Show local publication evidence and deletion blockers; never delete blobs")
+    coordinator_retry = commands.add_parser("coordinate-retry", help="Explicitly retry one failed observed upload")
+    coordinator_retry.add_argument("document_id")
+    coordinator_retry.add_argument("--state-dir", type=Path, default=ROOT / "data" / "azure-coordinator")
+    coordinator_retry.add_argument("--document-timeout", type=int, default=3600)
     args = parser.parse_args()
-    if args.command == "dispatch" and not 1 <= args.pages_per_task <= 100:
+    if args.command in ("dispatch", "coordinate"):
+        try:
+            extraction = ExtractionOptions.from_namespace(args)
+        except ValueError as error:
+            parser.error(str(error))
+    if args.command in ("dispatch", "coordinate") and not 1 <= args.pages_per_task <= 100:
         parser.error("--pages-per-task must be between 1 and 100")
     if args.command == "dispatch" and not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", args.document_id):
         parser.error("--document-id must be 1-100 letters, digits, underscores or hyphens")
@@ -54,11 +84,35 @@ def main() -> int:
         parser.error("--timeout-seconds must be between 1 and 900")
     if args.command in ("collect", "reconcile") and not re.fullmatch(r"[0-9a-f]{64}", args.version):
         parser.error("version must be the 64-character hash returned by dispatch")
+    if args.command in ("coordinate", "coordinate-retry"):
+        for field in ("poll_seconds", "check_seconds", "document_timeout", "max_attempts", "scan_limit", "work_limit"):
+            if hasattr(args, field) and getattr(args, field) < 1:
+                parser.error(f"--{field.replace('_', '-')} must be positive")
+    if args.command == "coordinate":
+        if args.scan_limit > 1000 or args.work_limit > 100:
+            parser.error("--scan-limit must be <=1000 and --work-limit <=100")
+        prefix = args.incoming_prefix
+        if not prefix or prefix.startswith("/") or not prefix.endswith("/") or prefix.split("/")[0] in ("sources", "manifests", "results"):
+            parser.error("Use a dedicated incoming prefix ending in /")
+    if args.command in ("coordinate-status", "coordinate-retry"):
+        from pdf_pipeline.orchestrator import CoordinatorState
+
+        state = CoordinatorState(args.state_dir)
+        if args.command == "coordinate-retry":
+            with state.consumer_lock():
+                state.retry_cloud(args.document_id, args.document_timeout)
+        report = state.status()
+        if args.command == "coordinate-status" and args.history:
+            report["history"] = state.history()
+        if args.command == "coordinate-status" and args.retirement_preview:
+            report["retirement_preview"] = state.retirement_preview()
+        print(json.dumps(report, indent=2))
+        return 0
 
     modules = ["azure.identity", "azure.storage.blob", "azure.servicebus", "dotenv"]
-    if args.command in ("dispatch", "worker"):
+    if args.command in ("dispatch", "worker", "coordinate"):
         modules.append("pymupdf")
-    if args.command == "collect" and args.index:
+    if args.command == "coordinate" or (args.command == "collect" and args.index):
         modules.extend(["chromadb", "sentence_transformers"])
     missing = [name for name in modules if dependency_missing(name)]
     if missing:
@@ -113,6 +167,48 @@ def main() -> int:
             retry_total=3,
         ))
         queue = os.environ["AZURE_SERVICEBUS_QUEUE"]
+        if args.command == "coordinate":
+            import pymupdf
+            from ingest_sources import DocumentPublisher
+            from pdf_pipeline.orchestrator import CoordinatorState, coordinator_cycle, emit_event
+
+            state = CoordinatorState(args.state_dir)
+            publisher = DocumentPublisher(str(args.database), args.collection)
+
+            def inspect_pdf(pdf):
+                with pymupdf.open(stream=pdf, filetype="pdf") as document:
+                    return len(document)
+
+            def index_records(records):
+                return publisher.publish(records, records[0]["metadata"]["processing_generation"])
+
+            sender = AzureSender(stack.enter_context(bus.get_queue_sender(queue)))
+            stop = Event()
+            with state.consumer_lock():
+                state.bind_cloud(os.environ["AZURE_STORAGE_ACCOUNT_URL"], os.environ["AZURE_STORAGE_CONTAINER"],
+                                 os.environ["AZURE_SERVICEBUS_NAMESPACE"] + "/" + queue,
+                                 args.incoming_prefix, args.database, args.collection, args.pages_per_task, extraction)
+                emit_event({"event": "azure_coordinator_started"})
+                while not stop.is_set():
+                    try:
+                        counts = coordinator_cycle(
+                            state, blobs, sender, inspect_pdf, index_records,
+                            prefix=args.incoming_prefix, pages_per_task=args.pages_per_task,
+                            scan_limit=args.scan_limit, work_limit=args.work_limit,
+                            check_seconds=args.check_seconds, document_timeout=args.document_timeout,
+                            max_attempts=args.max_attempts,
+                            require_receipt=True,
+                            extraction=extraction,
+                        )
+                        emit_event({"event": "azure_coordinator_progress", "states": counts})
+                    except Exception as error:
+                        emit_event({"event": "azure_coordinator_cycle_failed", "error_type": type(error).__name__})
+                        if args.once:
+                            return 2
+                    if args.once:
+                        return 2 if counts.get("failed", 0) else 0
+                    stop.wait(args.poll_seconds)
+            return 0
         if args.command in ("dispatch", "reconcile"):
             sender = AzureSender(stack.enter_context(bus.get_queue_sender(queue)))
             if args.command == "reconcile":
@@ -128,7 +224,8 @@ def main() -> int:
                 # cannot give a manifest for a different uploaded version.
                 with pymupdf.open(stream=pdf, filetype="pdf") as document:
                     page_count = len(document)
-                result = dispatch(blobs, sender, pdf, args.document_id, page_count, args.pages_per_task)
+                result = dispatch(blobs, sender, pdf, args.document_id, page_count, args.pages_per_task,
+                                  extraction=extraction)
             print(json.dumps(result))
             return 0
 

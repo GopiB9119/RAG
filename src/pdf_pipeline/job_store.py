@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -44,6 +45,10 @@ class JobStore:
                 CREATE INDEX IF NOT EXISTS jobs_source ON jobs(source, sequence);
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """)
+            connection.execute("BEGIN IMMEDIATE")
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
+            if "publication_receipt" not in columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN publication_receipt TEXT")
 
     @contextmanager
     def connect(self):
@@ -176,11 +181,27 @@ class JobStore:
             )
             return dict(connection.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone())
 
-    def finish(self, job_id: str, chunk_count: int) -> None:
+    def finish(self, job_id: str, chunk_count: int, *, receipt: dict | None = None) -> None:
+        if type(chunk_count) is not int or chunk_count < 1:
+            raise ValueError("chunk_count must be positive")
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if receipt is not None:
+                from index_publication import verify_publication_receipt
+
+                job = connection.execute("SELECT source FROM jobs WHERE id=? AND state='running'", (job_id,)).fetchone()
+                target = connection.execute("SELECT value FROM settings WHERE key='target'").fetchone()
+                if job is None or target is None:
+                    raise ValueError("Running job and bound index are required for receipt verification")
+                database, collection = json.loads(target["value"])
+                verified_count = verify_publication_receipt(receipt, database=database, collection=collection,
+                                                            source=job["source"], generation=job_id)
+                if verified_count != chunk_count:
+                    raise ValueError("Receipt chunk count does not match completion")
             changed = connection.execute(
-                """UPDATE jobs SET state='ready',chunk_count=?,error_type=NULL,updated_at=?
-                   WHERE id=? AND state='running'""", (chunk_count, time.time(), job_id),
+                """UPDATE jobs SET state='ready',chunk_count=?,error_type=NULL,updated_at=?,publication_receipt=?
+                   WHERE id=? AND state='running'""",
+                (chunk_count, time.time(), json.dumps(receipt, sort_keys=True) if receipt is not None else None, job_id),
             ).rowcount
             if changed != 1:
                 raise ValueError("Job is not running")
@@ -224,6 +245,23 @@ class JobStore:
             if row and row["value"] != target:
                 raise ValueError("This job store is bound to another index; use a separate state directory")
             connection.execute("INSERT OR IGNORE INTO settings VALUES ('target',?)", (target,))
+
+    def bind_extraction(self, extraction) -> None:
+        import json
+        from dataclasses import asdict
+        from .models import EXTRACTION_VERSION, ExtractionOptions
+
+        if not isinstance(extraction, ExtractionOptions):
+            raise ValueError("Invalid extraction policy")
+        policy = json.dumps({"version": EXTRACTION_VERSION, "options": asdict(extraction)}, sort_keys=True)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            old = connection.execute("SELECT value FROM settings WHERE key='extraction_policy'").fetchone()
+            if old and old["value"] != policy:
+                raise ValueError("Extraction policy changed; use a new state directory and deliberately re-ingest")
+            if old is None and connection.execute("SELECT 1 FROM jobs WHERE attempts>0 OR state!='queued' LIMIT 1").fetchone():
+                raise ValueError("Existing jobs used an unversioned extraction policy; use a new state directory")
+            connection.execute("INSERT OR IGNORE INTO settings VALUES ('extraction_policy',?)", (policy,))
 
     def retry(self, job_id: str) -> None:
         with self.connect() as connection:

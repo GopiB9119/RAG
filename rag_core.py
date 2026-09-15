@@ -9,6 +9,7 @@ import re
 from typing import Any
 
 from dotenv import load_dotenv
+from index_publication import PUBLICATION_SCHEMA, PublishedCollection
 
 load_dotenv()
 
@@ -24,6 +25,7 @@ COLLECTION_METADATA = {
     "embedding_model": MODEL_NAME,
     "normalized_embeddings": True,
     "hnsw:space": "l2",
+    "publication_schema": PUBLICATION_SCHEMA,
 }
 
 
@@ -31,6 +33,14 @@ def validate_collection(collection: Any) -> None:
     metadata = collection.metadata or {}
     if any(metadata.get(key) != value for key, value in COLLECTION_METADATA.items()):
         raise ValueError("Index embedding configuration is incompatible or unknown; rebuild with --reset")
+
+
+def open_published_collection(collection: Any, database: str, name: str) -> PublishedCollection:
+    validate_collection(collection)
+    view = PublishedCollection(collection, database, name)
+    with view.read_view():
+        pass
+    return view
 
 REQUIRED_AZURE_SETTINGS = (
     "AZURE_OPENAI_ENDPOINT",
@@ -119,6 +129,16 @@ def _query_collection(
 
 
 def retrieve(question: str, collection: Any, model: Any, chunk_count: int) -> Retrieved:
+    """Protect one complete revision snapshot until both retrieval passes finish."""
+    if isinstance(collection, PublishedCollection):
+        with collection.read_view() as view:
+            return _retrieve(question, view, model, view.count())
+    if (getattr(collection, "metadata", None) or {}).get("publication_schema") == PUBLICATION_SCHEMA:
+        raise ValueError("Versioned indexes must be opened with open_published_collection")
+    return _retrieve(question, collection, model, chunk_count)
+
+
+def _retrieve(question: str, collection: Any, model: Any, chunk_count: int) -> Retrieved:
     """Return (text, metadata, distance) triples for the closest indexed chunks.
 
     Hybrid retrieval: a vector pass finds chunks by meaning, then an exact
@@ -145,7 +165,7 @@ def retrieve(question: str, collection: Any, model: Any, chunk_count: int) -> Re
         for text, metadata, distance in triples:
             if not math.isfinite(distance) or distance > max_distance:
                 continue
-            key = f"{metadata.get('source')}|{metadata.get('page')}|{metadata.get('chunk')}"
+            key = f"{metadata.get('source')}|{metadata.get('page')}|{metadata.get('chunk')}|{metadata.get('token_part', 0)}"
             if key not in candidates or distance < candidates[key][2]:
                 candidates[key] = (text, metadata, distance)
 

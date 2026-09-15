@@ -201,45 +201,32 @@ def test_killed_process_releases_lock_and_job_is_recovered(tmp_path):
 
 
 def test_processor_verifies_snapshot_preserves_source_and_reuses_model(tmp_path, monkeypatch):
-    import sys
-    from types import ModuleType
     from pathlib import Path
     import ingest_sources
     from jobs import make_processor
+    from test_rag import FakeCollection, install_index_fakes
 
     store = JobStore(tmp_path / "state")
     source = pdf(tmp_path)
     job = store.enqueue(source)
-    models = []
-    model = object()
-    transformers = ModuleType("sentence_transformers")
+    collection = FakeCollection()
+    model = install_index_fakes(monkeypatch, collection)
 
-    def create_model(name):
-        models.append(name)
-        return model
-
-    def load_pdf(snapshot, *, source, workers, checkpoint_root, pages_per_task):
+    def load_pdf(snapshot, *, source, workers, checkpoint_root, pages_per_task, extraction):
         assert str(snapshot) == job["snapshot"]
         assert source == job["source"]
         assert workers == 2
         assert checkpoint_root == str(store.root / "checkpoints")
         assert pages_per_task == 10
+        assert extraction.ocr == "off"
         return [{"text": "Extracted text.", "metadata": {"source": source, "page": 1, "type": "pdf"}}]
 
-    def build_index(chunks, database, collection, reset, **kwargs):
-        assert kwargs["model"] is model
-        assert chunks[0]["metadata"]["source"] == job["source"]
-        assert chunks[0]["metadata"]["chunk"] == 0
-        assert reset is False
-        return len(chunks)
-
-    transformers.SentenceTransformer = create_model
-    monkeypatch.setitem(sys.modules, "sentence_transformers", transformers)
     monkeypatch.setattr(ingest_sources, "load_pdf", load_pdf)
-    monkeypatch.setattr(ingest_sources, "build_index", build_index)
     process = make_processor(tmp_path / "index", "documents", 2)
-    assert process(job) == process(job) == 1
-    assert len(models) == 1
+    first = process(job)
+    assert process(job) == first
+    assert first["chunk_count"] == 1 and first["generation"] == job["id"]
+    assert len(model.batches) == 1
     Path(job["snapshot"]).write_bytes(b"tampered")
     with pytest.raises(ValueError, match="integrity check"):
         process(job)
@@ -353,6 +340,60 @@ def test_scanner_rejects_invalid_file_without_blocking_valid_pdf(tmp_path, monke
     assert capsys.readouterr().out.count("watch_upload_rejected") == 1
 
 
+@pytest.mark.parametrize("code", [sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, 517])
+def test_scanner_retries_queue_lock_without_losing_file(tmp_path, monkeypatch, capsys, code):
+    import pdf_pipeline.watcher as module
+
+    clock = [0.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    folder = tmp_path / "input"
+    folder.mkdir()
+    source = pdf(folder)
+    store = JobStore(tmp_path / "state")
+    scanner = module.FolderScanner(folder, store, stable_seconds=1)
+    scanner.scan()
+    clock[0] = 2
+    original_enqueue = store.enqueue
+
+    def busy(*args):
+        error = sqlite3.OperationalError("private path details")
+        error.sqlite_errorcode = code
+        raise error
+
+    monkeypatch.setattr(store, "enqueue", busy)
+    assert scanner.scan() == 0
+    assert source not in scanner.submitted
+    output = capsys.readouterr().out
+    assert "watch_queue_busy" in output and "private path details" not in output
+    monkeypatch.setattr(store, "enqueue", original_enqueue)
+    assert scanner.scan() == 1
+    assert scanner.scan() == 0
+    assert store.counts() == {"queued": 1}
+
+
+def test_scanner_does_not_hide_database_faults(tmp_path, monkeypatch):
+    import pdf_pipeline.watcher as module
+
+    clock = [0.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    folder = tmp_path / "input"
+    folder.mkdir()
+    pdf(folder)
+    store = JobStore(tmp_path / "state")
+    scanner = module.FolderScanner(folder, store, stable_seconds=1)
+    scanner.scan()
+    clock[0] = 2
+
+    def broken(*args):
+        error = sqlite3.OperationalError("Database I/O failure")
+        error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+        raise error
+
+    monkeypatch.setattr(store, "enqueue", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        scanner.scan()
+
+
 def test_watch_preflight_does_not_start_or_claim_work(tmp_path, monkeypatch, capsys):
     import sys
     import jobs
@@ -460,3 +501,166 @@ def test_cleanup_failure_does_not_requeue_success(tmp_path, monkeypatch, capsys,
     assert store.counts() == {"ready": 1}
     output = capsys.readouterr().out
     assert "cleanup_deferred" in output and "Private details" not in output
+
+
+@pytest.mark.parametrize("failure", [BrokenPipeError, ValueError])
+def test_cleanup_log_failure_cannot_requeue_ready_job(tmp_path, monkeypatch, failure):
+    import jobs
+
+    store = JobStore(tmp_path / "state")
+    store.enqueue(pdf(tmp_path))
+
+    def cleanup_failed(job_id):
+        raise PermissionError("private details")
+
+    def output_closed(*args, **kwargs):
+        raise failure("closed output")
+
+    monkeypatch.setattr(store, "cleanup_ready_artifacts", cleanup_failed)
+    monkeypatch.setattr(jobs, "print", output_closed, raising=False)
+    result = jobs.consume(store, lambda job: 1, tmp_path / "index", "documents")
+    assert result["ready"] == 1 and result["errors"] == 0
+    assert store.counts() == {"ready": 1}
+    assert store.list_jobs()[0]["attempts"] == 1
+
+
+def test_queue_extraction_policy_prevents_silent_config_reuse(tmp_path):
+    from pdf_pipeline.models import ExtractionOptions
+
+    store = JobStore(tmp_path / "state")
+    source = pdf(tmp_path)
+    queued = store.enqueue(source)
+    native = ExtractionOptions()
+    with store.consumer_lock():
+        store.bind_extraction(native)
+        store.claim()
+        store.finish(queued["id"], 1)
+        store.bind_extraction(native)
+        with pytest.raises(ValueError, match="policy changed"):
+            store.bind_extraction(ExtractionOptions(ocr="auto"))
+    assert source.is_file()
+    assert store.counts() == {"ready": 1}
+    legacy = JobStore(tmp_path / "legacy")
+    legacy.enqueue(source)
+    with legacy.consumer_lock():
+        legacy.claim()
+        with pytest.raises(ValueError, match="unversioned"):
+            legacy.bind_extraction(native)
+
+
+def test_watch_cli_passes_one_shared_ocr_policy(tmp_path, monkeypatch):
+    import sys
+    import jobs
+    from pdf_pipeline.models import ExtractionOptions
+
+    seen = []
+    monkeypatch.setattr(jobs.importlib.util, "find_spec", lambda name: object())
+
+    def processor(database, collection, workers, pages_per_task, extraction):
+        seen.append(extraction)
+        return object()
+
+    def watcher(*args, **kwargs):
+        seen.append(kwargs["extraction"])
+        assert kwargs["require_receipt"] is True
+
+    monkeypatch.setattr(jobs, "make_processor", processor)
+    monkeypatch.setattr(jobs, "watch", watcher)
+    monkeypatch.setattr(sys, "argv", ["jobs.py", "--state-dir", str(tmp_path / "state"), "watch",
+                                     str(tmp_path / "input"), "--ocr", "auto", "--ocr-language", "eng+hin",
+                                     "--ocr-dpi", "200"])
+    assert jobs.main() == 0
+    assert seen == [ExtractionOptions(ocr="auto", language="eng+hin", dpi=200)] * 2
+
+
+def test_local_publication_receipt_recovers_ready_write_gap(tmp_path, monkeypatch):
+    import json
+    from pathlib import Path
+    import ingest_sources
+    import jobs
+    import pdf_pipeline.job_store as store_module
+    from test_rag import FakeCollection, install_index_fakes
+
+    now = [100.0]
+    monkeypatch.setattr(store_module.time, "time", lambda: now[0])
+    store = JobStore(tmp_path / "state")
+    source = pdf(tmp_path)
+    queued = store.enqueue(source)
+    collection = FakeCollection()
+    model = install_index_fakes(monkeypatch, collection)
+    monkeypatch.setattr(ingest_sources, "load_pdf", lambda path, **kwargs: [
+        {"text": "Extracted page.", "metadata": {"source": kwargs["source"], "page": 1}},
+    ])
+    processor = jobs.make_processor(tmp_path / "index", "documents", 2)
+
+    def interrupted_finish(*args, **kwargs):
+        raise OSError("Ready-state write failed")
+
+    monkeypatch.setattr(store, "finish", interrupted_finish)
+    first = jobs.consume(store, processor, tmp_path / "index", "documents", require_receipt=True)
+    assert first["errors"] == 1 and first["states"] == {"queued": 1}
+    assert len(model.batches) == 1 and collection.count() == 1
+    assert Path(queued["snapshot"]).exists()
+    reopened = JobStore(store.root)
+    now[0] += 6
+    retry = jobs.consume(reopened, processor, tmp_path / "index", "documents", require_receipt=True)
+    assert retry["ready"] == 1 and retry["errors"] == 0
+    assert len(model.batches) == 1 and collection.count() == 1
+    stored = reopened.list_jobs()[0]
+    receipt = json.loads(stored["publication_receipt"])
+    assert receipt["generation"] == queued["id"] and receipt["source"] == str(source.resolve())
+    assert receipt["chunk_count"] == stored["chunk_count"] == 1
+    assert source.exists() and not Path(queued["snapshot"]).exists()
+
+
+def test_production_local_consumer_requires_committed_receipt(tmp_path):
+    from pathlib import Path
+    from jobs import consume
+
+    store = JobStore(tmp_path / "state")
+    queued = store.enqueue(pdf(tmp_path), max_attempts=1)
+    result = consume(store, lambda job: 1, tmp_path / "index", "documents", require_receipt=True)
+    assert result["errors"] == 1 and store.counts() == {"failed": 1}
+    assert Path(queued["snapshot"]).exists()
+    assert store.list_jobs()[0]["publication_receipt"] is None
+
+
+def test_local_completion_rejects_another_jobs_receipt(tmp_path, monkeypatch):
+    from pathlib import Path
+    from jobs import consume
+    from ingest_sources import DocumentPublisher
+    from test_rag import FakeCollection, install_index_fakes
+
+    collection = FakeCollection()
+    install_index_fakes(monkeypatch, collection)
+    store = JobStore(tmp_path / "state")
+    source = pdf(tmp_path)
+    queued = store.enqueue(source, max_attempts=1)
+    publisher = DocumentPublisher(str(tmp_path / "index"), "documents")
+    wrong_receipt = publisher.publish(
+        [{"text": "Page text.", "metadata": {"source": str(source.resolve()), "page": 1}}], "a" * 32,
+    )
+    result = consume(store, lambda job: wrong_receipt, tmp_path / "index", "documents", require_receipt=True)
+    assert result["errors"] == 1 and store.counts() == {"failed": 1}
+    assert Path(queued["snapshot"]).exists()
+
+
+def test_legacy_local_jobs_migrate_without_invented_receipts(tmp_path):
+    root = tmp_path / "state"
+    root.mkdir()
+    with sqlite3.connect(root / "jobs.sqlite3") as connection:
+        connection.executescript("""
+            CREATE TABLE jobs (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
+                source TEXT, content_hash TEXT, snapshot TEXT, state TEXT,
+                attempts INTEGER, max_attempts INTEGER, available_at REAL,
+                created_at REAL, updated_at REAL, error_type TEXT, chunk_count INTEGER
+            );
+            INSERT INTO jobs (id,source,content_hash,snapshot,state,attempts,max_attempts,
+                available_at,created_at,updated_at,chunk_count)
+                VALUES ('old-job','old.pdf','hash','snapshot.pdf','ready',1,3,0,0,0,5);
+        """)
+    store = JobStore(root)
+    old = store.list_jobs()[0]
+    assert old["state"] == "ready" and old["chunk_count"] == 5
+    assert old["publication_receipt"] is None

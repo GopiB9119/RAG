@@ -9,6 +9,7 @@ dist/
 !.env.example
 chroma_data/
 data/jobs/
+data/azure-coordinator/
 data/input/*
 !data/input/.gitkeep
 data/output/*

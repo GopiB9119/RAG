@@ -97,7 +97,7 @@ def run_baseline(output_root: Path, workers: int = 4, azure: bool = False) -> tu
         import chromadb
         from sentence_transformers import SentenceTransformer
         from ingest_sources import build_index, chunk_records, load_pdf
-        from rag_core import MODEL_NAME, REQUIRED_AZURE_SETTINGS, generate_answer, retrieve, validate_collection
+        from rag_core import MODEL_NAME, REQUIRED_AZURE_SETTINGS, generate_answer, retrieve, open_published_collection
 
         if azure:
             missing_settings = [name for name in REQUIRED_AZURE_SETTINGS if not os.environ.get(name)]
@@ -149,9 +149,9 @@ def run_baseline(output_root: Path, workers: int = 4, azure: bool = False) -> tu
         database = str(run_directory / "index")
         stored = build_index(chunks, database, "baseline_documents", False)
         collection = chromadb.PersistentClient(path=database).get_collection("baseline_documents")
-        validate_collection(collection)
-        if stored != len(chunks) or collection.count() != len(chunks):
-            raise ValueError("Vector count does not match chunk count")
+        collection = open_published_collection(collection, database, "baseline_documents")
+        if stored < len(chunks) or collection.count() != stored:
+            raise ValueError("Published vector count does not match token-prepared chunks")
         report["indexed_chunks"] = stored
         complete_stage(stage, since)
 

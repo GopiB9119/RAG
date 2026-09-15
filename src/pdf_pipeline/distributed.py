@@ -6,18 +6,18 @@ import hashlib
 import json
 import re
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Protocol
 
 from .checkpoints import validate_range_result
-from .models import PageRangeJob, PageRangeResult, PageResult
+from .models import EXTRACTION_VERSION, ExtractionOptions, PageRangeJob, PageRangeResult, PageResult
 
 
 MAX_PDF_BYTES = 100 * 1024 * 1024
 MAX_RESULT_BYTES = 16 * 1024 * 1024
 MAX_PAGES = 100000
-SCHEMA = 1
+SCHEMA = 2
 
 
 class InvalidTask(ValueError):
@@ -52,6 +52,8 @@ class Manifest:
     page_count: int
     pages_per_task: int
     schema: int = SCHEMA
+    extraction: ExtractionOptions = field(default_factory=ExtractionOptions)
+    extraction_version: int = EXTRACTION_VERSION
 
     def __post_init__(self):
         if not isinstance(self.document_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", self.document_id):
@@ -64,6 +66,8 @@ class Manifest:
             raise InvalidTask("Range size must be between 1 and 100")
         if type(self.schema) is not int or self.schema != SCHEMA:
             raise InvalidTask("Unsupported manifest schema")
+        if not isinstance(self.extraction, ExtractionOptions) or type(self.extraction_version) is not int or self.extraction_version != EXTRACTION_VERSION:
+            raise InvalidTask("Unsupported extraction policy version")
 
     @property
     def version(self) -> str:
@@ -84,7 +88,7 @@ class Manifest:
                 or end != min(start + self.pages_per_task, self.page_count)):
             raise InvalidTask("Range does not match manifest")
         return PageRangeJob(f"{self.document_id}:pages:{start:06d}-{end:06d}",
-                            self.document_id, pdf_path, start, end)
+                            self.document_id, pdf_path, start, end, self.extraction)
 
 
 def validate_task(task: dict) -> None:
@@ -105,8 +109,10 @@ def load_manifest(blobs: BlobStore, version: str) -> Manifest:
     if data is None:
         raise IncompleteDocument("Manifest is unavailable")
     try:
-        manifest = Manifest(**json.loads(data))
-    except (TypeError, ValueError) as error:
+        fields = json.loads(data)
+        fields["extraction"] = ExtractionOptions(**fields["extraction"])
+        manifest = Manifest(**fields)
+    except (TypeError, ValueError, KeyError) as error:
         raise InvalidTask("Invalid manifest") from error
     if manifest.version != version:
         raise InvalidTask("Manifest identity mismatch")
@@ -142,10 +148,11 @@ def create_verified(blobs: BlobStore, name: str, data: bytes, limit: int) -> Non
 
 
 def dispatch(blobs: BlobStore, sender: TaskSender, pdf: bytes, document_id: str,
-             page_count: int, pages_per_task: int = 10) -> dict:
+             page_count: int, pages_per_task: int = 10, *, extraction: ExtractionOptions | None = None) -> dict:
     if not pdf.startswith(b"%PDF-") or len(pdf) > MAX_PDF_BYTES:
         raise InvalidTask("PDF header or size limit check failed")
-    manifest = Manifest(document_id, sha256(pdf), page_count, pages_per_task)
+    manifest = Manifest(document_id, sha256(pdf), page_count, pages_per_task,
+                        extraction=extraction or ExtractionOptions())
     # Save source and manifest BEFORE sending. If sending fails halfway, repeating
     # dispatch or reconcile sends missing work again; completed ranges are skipped.
     create_verified(blobs, manifest.source_blob, pdf, MAX_PDF_BYTES)
@@ -207,6 +214,7 @@ def collect_records(blobs: BlobStore, version: str) -> list[dict]:
                 records.append({"text": text, "metadata": {
                     "source": f"{manifest.document_id}.pdf", "title": f"{manifest.document_id}.pdf",
                     "type": "pdf", "page": page.page_index + 1, "version": version,
+                    "extraction_method": page.extraction_method,
                 }})
     if not records:
         raise ValueError("PDF contains no readable text; OCR is required")

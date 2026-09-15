@@ -18,6 +18,7 @@ import logging
 import re
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
@@ -30,6 +31,8 @@ from rag_core import (
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
+from pdf_pipeline.models import ExtractionOptions
 
 logger = logging.getLogger(__name__)
 
@@ -101,17 +104,19 @@ def title_from_source(source: str) -> str:
     return re.split(r"[\\/]", without_query)[-1] or source
 
 
-def extract_pdf(content: bytes, source: str, *, workers: int = 4) -> list[dict[str, Any]]:
+def extract_pdf(content: bytes, source: str, *, workers: int = 4,
+                extraction: ExtractionOptions | None = None) -> list[dict[str, Any]]:
     """Extract one text record per PDF page from raw PDF bytes."""
     with tempfile.TemporaryDirectory(prefix="rag-download-") as directory:
         path = Path(directory) / "download.pdf"
         path.write_bytes(content)
-        return load_pdf(path, source=source, workers=workers)
+        return load_pdf(path, source=source, workers=workers, extraction=extraction)
 
 
 def load_pdf(
     path: Path, source: str | None = None, *, workers: int = 4,
     checkpoint_root: str | None = None, pages_per_task: int = 1,
+    extraction: ExtractionOptions | None = None,
 ) -> list[dict[str, Any]]:
     """Extract one text record per page from a local PDF file."""
     from pdf_pipeline.main import run_pipeline
@@ -122,6 +127,7 @@ def load_pdf(
         pdf_path=str(resolved), document_id="rag-document", workers=workers,
         output_root="", write_outputs=False,
         checkpoint_root=checkpoint_root, pages_per_task=pages_per_task,
+        extraction=extraction,
     )
     if summary["status"] != "complete":
         raise RuntimeError(f"PDF extraction failed on pages: {summary['failed_pages']}")
@@ -132,7 +138,8 @@ def load_pdf(
             records.append({
                 "text": text,
                 "metadata": {"source": source, "title": title_from_source(source),
-                             "type": "pdf", "page": page["page_number"]},
+                             "type": "pdf", "page": page["page_number"],
+                             "extraction_method": page["extraction_method"]},
             })
     if not records:
         raise ValueError("PDF contains no readable text; use OCR for scanned pages")
@@ -177,11 +184,11 @@ def extract_html(html: str, url: str) -> list[dict[str, Any]]:
     }]
 
 
-def load_url(url: str, *, workers: int = 4) -> list[dict[str, Any]]:
+def load_url(url: str, *, workers: int = 4, extraction: ExtractionOptions | None = None) -> list[dict[str, Any]]:
     """Load one URL: a PDF is parsed page by page, HTML as a single record."""
     response = fetch_url(url)
     if is_pdf_response(response, url):
-        return extract_pdf(response.content, url, workers=workers)
+        return extract_pdf(response.content, url, workers=workers, extraction=extraction)
     return extract_html(response.text, url)
 
 
@@ -194,13 +201,14 @@ def discover_pdf_links(url: str, html: str) -> list[str]:
     ))
 
 
-def load_linked_pdfs(url: str, html: str, *, workers: int = 4) -> list[dict[str, Any]]:
+def load_linked_pdfs(url: str, html: str, *, workers: int = 4,
+                    extraction: ExtractionOptions | None = None) -> list[dict[str, Any]]:
     """Download and parse every PDF linked from an HTML page."""
     records: list[dict[str, Any]] = []
     for pdf_url in discover_pdf_links(url, html):
         logger.info("  [linked PDF] %s", pdf_url)
         try:
-            records.extend(extract_pdf(fetch_url(pdf_url).content, pdf_url, workers=workers))
+            records.extend(extract_pdf(fetch_url(pdf_url).content, pdf_url, workers=workers, extraction=extraction))
         except Exception as error:
             logger.warning("    Skipped linked PDF: %s", error)
     return records
@@ -208,6 +216,7 @@ def load_linked_pdfs(url: str, html: str, *, workers: int = 4) -> list[dict[str,
 
 def load_url_list(
     urls: list[str], discover_pdfs: bool, *, workers: int = 4,
+    extraction: ExtractionOptions | None = None,
 ) -> list[dict[str, Any]]:
     """Load each URL once; optionally follow linked PDFs from HTML pages."""
     records: list[dict[str, Any]] = []
@@ -216,29 +225,31 @@ def load_url_list(
         try:
             response = fetch_url(url)
             if is_pdf_response(response, url):
-                records.extend(extract_pdf(response.content, url, workers=workers))
+                records.extend(extract_pdf(response.content, url, workers=workers, extraction=extraction))
                 continue
             records.extend(extract_html(response.text, url))
             if discover_pdfs:
-                records.extend(load_linked_pdfs(url, response.text, workers=workers))
+                records.extend(load_linked_pdfs(url, response.text, workers=workers, extraction=extraction))
         except Exception as error:
             logger.warning("  Skipped: %s", error)
     return records
 
 
-def load_pdf_paths(paths: list[str], *, workers: int = 4) -> list[dict[str, Any]]:
+def load_pdf_paths(paths: list[str], *, workers: int = 4,
+                   extraction: ExtractionOptions | None = None) -> list[dict[str, Any]]:
     """Load explicitly provided PDF files, skipping ones that fail."""
     records: list[dict[str, Any]] = []
     for path in paths:
         logger.info("Reading %s", path)
         try:
-            records.extend(load_pdf(Path(path), workers=workers))
+            records.extend(load_pdf(Path(path), workers=workers, extraction=extraction))
         except Exception as error:
             logger.warning("  Skipped %s: %s", path, error)
     return records
 
 
-def load_pdf_dir(pdf_dir: Path, *, workers: int = 4) -> list[dict[str, Any]]:
+def load_pdf_dir(pdf_dir: Path, *, workers: int = 4,
+                 extraction: ExtractionOptions | None = None) -> list[dict[str, Any]]:
     """Load every PDF under pdf_dir, skipping ones that fail."""
     if not pdf_dir.exists():
         logger.warning("PDF folder not found, continuing: %s", pdf_dir)
@@ -248,7 +259,7 @@ def load_pdf_dir(pdf_dir: Path, *, workers: int = 4) -> list[dict[str, Any]]:
     for number, path in enumerate(pdf_paths, start=1):
         logger.info("[%d/%d] Reading %s", number, len(pdf_paths), path)
         try:
-            records.extend(load_pdf(path, workers=workers))
+            records.extend(load_pdf(path, workers=workers, extraction=extraction))
         except Exception as error:
             logger.warning("  Skipped: %s", error)
     return records
@@ -282,9 +293,11 @@ def chunk_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def make_record_id(metadata: dict[str, Any], text: str) -> str:
     """Stable content hash so re-ingesting updates instead of duplicating."""
-    # Stable content IDs let the same document replay without duplicate vectors.
-    # Edited text creates a new ID; build_index removes obsolete IDs after upserts.
+    # Content IDs deduplicate input. Stored vector IDs also include an immutable
+    # publication revision so staging never overwrites a visible document.
     value = f"{metadata['source']}|{metadata['page']}|{metadata['chunk']}|{text}"
+    if "token_part" in metadata:
+        value += f"|token_part:{metadata['token_part']}"
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
@@ -295,63 +308,114 @@ def build_index(
     reset: bool,
     *,
     model: Any = None,
-) -> int:
-    """Embed chunks and upsert them into Chroma; return the number stored."""
+    publication_generation: str | None = None,
+) -> int | dict:
+    """Stage complete immutable revisions and atomically publish their pointers."""
     import chromadb
     from chromadb.errors import NotFoundError
     from sentence_transformers import SentenceTransformer
+    from index_publication import PublicationStore, REVISION_FIELD
 
     # Dictionary keys remove identical input chunks before passing IDs to Chroma.
     chunks = list({make_record_id(chunk["metadata"], chunk["text"]): chunk for chunk in chunks}.values())
     if not chunks:
         raise ValueError("Cannot index an empty set of chunks")
+    if publication_generation is not None:
+        if not re.fullmatch(r"[0-9a-f]{32}", publication_generation):
+            raise ValueError("publication_generation must be a 32-character generation ID")
+        if len({chunk["metadata"]["source"] for chunk in chunks}) != 1:
+            raise ValueError("A publication receipt must describe exactly one source")
     logger.info("Creating embeddings for %d chunks...", len(chunks))
     if model is None:
         model = SentenceTransformer(MODEL_NAME)
 
-    client = chromadb.PersistentClient(path=database)
-    if reset:
-        # Destructive operation: reset deletes this collection. It is never used
-        # by the durable job consumer, only by an explicit ingestion command.
-        try:
-            client.delete_collection(collection_name)
-        except NotFoundError:
-            logger.info("No existing collection '%s' to delete.", collection_name)
-    collection = client.get_or_create_collection(name=collection_name, metadata=COLLECTION_METADATA)
-    validate_collection(collection)
-    source_ids: dict[str, set[str]] = {}
-    for chunk in chunks:
-        source_ids.setdefault(chunk["metadata"]["source"], set()).add(
-            make_record_id(chunk["metadata"], chunk["text"])
-        )
+    from embedding_chunks import fit_embedding_chunks
 
-    for start in range(0, len(chunks), UPSERT_BATCH_SIZE):
-        end = start + UPSERT_BATCH_SIZE
-        batch = chunks[start:end]
-        # Normalize document vectors in the same way as question vectors in retrieve().
-        # Batches bound this encoding call; the whole chunk list is still in memory.
-        vectors = model.encode(
-            [chunk["text"] for chunk in batch],
-            show_progress_bar=True,
-            normalize_embeddings=True,
-        ).tolist()
-        # Four aligned lists: ID, original text, vector, and citation metadata.
-        # Position i in each list must describe the SAME chunk.
-        collection.upsert(
-            ids=[make_record_id(chunk["metadata"], chunk["text"]) for chunk in batch],
-            documents=[chunk["text"] for chunk in batch],
-            embeddings=vectors,
-            metadatas=[chunk["metadata"] for chunk in batch],
-        )
-        logger.info("Stored chunks %d-%d of %d", start + 1, min(end, len(chunks)), len(chunks))
-    # Prune only after all upserts succeed. This is NOT an atomic version swap:
-    # a partial write can coexist with old chunks until a successful retry.
-    for source, current_ids in source_ids.items():
-        existing = collection.get(where={"source": source}, include=[])["ids"]
-        obsolete = [record_id for record_id in existing if record_id not in current_ids]
-        for start in range(0, len(obsolete), UPSERT_BATCH_SIZE):
-            collection.delete(ids=obsolete[start:start + UPSERT_BATCH_SIZE])
-    return len(chunks)
+    # Enforce the actual tokenizer budget before touching collection/publication
+    # state, including before a requested destructive reset.
+    chunks = fit_embedding_chunks(chunks, model)
+    input_hash = hashlib.sha256(json.dumps(chunks, sort_keys=True, ensure_ascii=False,
+                                          separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    client = chromadb.PersistentClient(path=database)
+    publications = PublicationStore(database)
+    # Register the empty collection durably before staging any vectors. If the
+    # first attempt crashes, its uncommitted vectors can be safely ignored on retry.
+    with publications.writer() as connection:
+        if reset:
+            # Reset remains destructive maintenance: all readers must be stopped.
+            try:
+                client.delete_collection(collection_name)
+            except NotFoundError:
+                logger.info("No existing collection '%s' to delete.", collection_name)
+        collection = client.get_or_create_collection(name=collection_name, metadata=COLLECTION_METADATA)
+        validate_collection(collection)
+        publications.bind(connection, collection_name, collection, reset)
+    grouped: dict[str, list[dict]] = {}
+    for chunk in chunks:
+        grouped.setdefault(chunk["metadata"]["source"], []).append(chunk)
+    with publications.writer() as connection:
+        publications.bind(connection, collection_name, collection, False)
+        if publication_generation is not None:
+            existing = publications.receipt(connection, collection_name, str(collection.id),
+                                             publication_generation, input_hash)
+            if existing is not None:
+                # A committed generation must never be republished over a newer
+                # source revision. Return the historical receipt, not a new write.
+                return existing
+        for source, document_chunks in grouped.items():
+            revision = uuid.uuid4().hex
+            expected_ids = set()
+            for start in range(0, len(document_chunks), UPSERT_BATCH_SIZE):
+                batch = document_chunks[start:start + UPSERT_BATCH_SIZE]
+                vectors = model.encode([chunk["text"] for chunk in batch],
+                                       show_progress_bar=True, normalize_embeddings=True).tolist()
+                ids = [f"{revision}:{make_record_id(chunk['metadata'], chunk['text'])}" for chunk in batch]
+                expected_ids.update(ids)
+                collection.upsert(
+                    ids=ids, documents=[chunk["text"] for chunk in batch], embeddings=vectors,
+                    metadatas=[{**chunk["metadata"], REVISION_FIELD: revision} for chunk in batch],
+                )
+            actual_ids = collection.get(where={REVISION_FIELD: revision}, include=[])["ids"]
+            if len(actual_ids) != len(expected_ids) or set(actual_ids) != expected_ids:
+                raise RuntimeError("Staged revision does not contain every expected chunk")
+            publications.publish(connection, collection_name, source, revision, len(expected_ids))
+            if publication_generation is not None:
+                receipt = publications.record_receipt(connection, collection_name, str(collection.id),
+                                                       publication_generation, input_hash, source, revision,
+                                                       len(expected_ids))
+        # Context exit commits all pointers together. Old and failed revisions stay
+        # stored so readers that pinned an earlier view can finish safely.
+    logger.info("Published %d chunks across %d documents.", len(chunks), len(grouped))
+    return receipt if publication_generation is not None else len(chunks)
+
+
+class DocumentPublisher:
+    """Shared local/Azure publication service; input adapters supply page records."""
+
+    def __init__(self, database: str, collection: str):
+        self.database = str(Path(database).resolve())
+        self.collection = collection
+        self.model = None
+
+    def publish(self, records: list[dict], generation: str) -> dict:
+        if not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{32}", generation):
+            raise ValueError("A valid processing generation is required")
+        if not records or len({record["metadata"]["source"] for record in records}) != 1:
+            raise ValueError("Publication requires nonempty records for exactly one source")
+        if self.model is None:
+            from sentence_transformers import SentenceTransformer
+
+            self.model = SentenceTransformer(MODEL_NAME)
+        # One model, chunking path, token budget, and atomic receipt protocol for
+        # both adapters. No queue or cloud SDK belongs in this service.
+        receipt = build_index(chunk_records(records), self.database, self.collection, False,
+                              model=self.model, publication_generation=generation)
+        from index_publication import verify_publication_receipt
+
+        verify_publication_receipt(receipt, database=self.database, collection=self.collection,
+                                   source=records[0]["metadata"]["source"], generation=generation)
+        return receipt
 
 
 def parse_args() -> argparse.Namespace:
@@ -360,6 +424,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pdf-dir", default="data/input", help="Folder of local PDF files")
     parser.add_argument("--workers", type=int, default=4, help="PDF extraction worker processes")
+    ExtractionOptions.add_arguments(parser)
     parser.add_argument("--urls-file", default="urls.txt", help="Text file with one URL per line")
     parser.add_argument("--pdf", action="append", default=[], metavar="FILE",
                         help="Single PDF file to index (repeatable)")
@@ -377,6 +442,10 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.workers < 1:
         parser.error("--workers must be at least 1")
+    try:
+        args.extraction = ExtractionOptions.from_namespace(args)
+    except ValueError as error:
+        parser.error(str(error))
     return args
 
 
@@ -385,12 +454,13 @@ def main() -> None:
     args = parse_args()
 
     records = [
-        *load_pdf_paths(args.pdf, workers=args.workers),
-        *load_pdf_dir(Path(args.pdf_dir), workers=args.workers),
+        *load_pdf_paths(args.pdf, workers=args.workers, extraction=args.extraction),
+        *load_pdf_dir(Path(args.pdf_dir), workers=args.workers, extraction=args.extraction),
         *load_url_list(
             [*args.url, *read_urls_file(Path(args.urls_file))],
             args.discover_pdfs,
             workers=args.workers,
+            extraction=args.extraction,
         ),
     ]
     chunks = chunk_records(records)

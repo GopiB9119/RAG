@@ -41,6 +41,42 @@ class AzureBlobs:
         except ResourceExistsError:
             return False
 
+    def list_uploads(self, prefix: str, cursor, limit: int):
+        pages = self.container.list_blobs(name_starts_with=prefix, results_per_page=limit).by_page(
+            continuation_token=cursor,
+        )
+        try:
+            page = next(pages)
+        except StopIteration:
+            return [], None
+        uploads = [{"name": blob.name, "etag": str(blob.etag)} for blob in page
+                   if blob.name.lower().endswith(".pdf")]
+        return uploads, pages.continuation_token
+
+    def upload_matches(self, name: str, etag: str) -> bool:
+        from azure.core.exceptions import ResourceNotFoundError
+
+        try:
+            return str(self.container.get_blob_client(name).get_blob_properties().etag) == etag
+        except ResourceNotFoundError:
+            return False
+
+    def read_upload(self, name: str, etag: str, limit: int) -> bytes:
+        from azure.core import MatchConditions
+
+        blob = self.container.get_blob_client(name)
+        if blob.get_blob_properties().size > limit:
+            raise InvalidTask("Upload exceeds permitted size")
+        data = bytearray()
+        # Refuse a changed ETag instead of silently dispatching bytes that belong
+        # to a different version from the coordinator's durable observation.
+        for block in blob.download_blob(etag=etag, match_condition=MatchConditions.IfNotModified,
+                                        max_concurrency=1).chunks():
+            data.extend(block)
+            if len(data) > limit:
+                raise InvalidTask("Upload exceeds permitted size")
+        return bytes(data)
+
 
 class AzureSender:
     def __init__(self, sender):

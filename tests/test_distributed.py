@@ -93,6 +93,31 @@ def test_changed_pdf_is_a_separate_version():
         collect_records(blobs, second["version"])
 
 
+def test_distributed_policy_is_versioned_and_delivered_to_worker():
+    from pdf_pipeline.models import ExtractionOptions
+    from pdf_pipeline.distributed import load_manifest
+
+    blobs, sender = MemoryBlobs(), MemorySender()
+    off = dispatch(blobs, sender, b"%PDF-1.7\nfixture", "report", 1)
+    task = sender.messages[0][0]
+    process_task(blobs, task, extracted)
+    policy = ExtractionOptions(ocr="auto", language="eng+hin", dpi=200)
+    auto = dispatch(blobs, sender, b"%PDF-1.7\nfixture", "report", 1, extraction=policy)
+    assert auto["version"] != off["version"]
+    assert load_manifest(blobs, auto["version"]).extraction == policy
+
+    def ocr_extractor(job):
+        assert job.extraction == policy
+        result = extracted(job)
+        result.pages[0].extraction_method = "ocr"
+        return result
+
+    process_task(blobs, sender.messages[-1][0], ocr_extractor)
+    assert collect_records(blobs, auto["version"])[0]["metadata"]["extraction_method"] == "ocr"
+    with pytest.raises(InvalidTask, match="schema"):
+        process_task(blobs, {**task, "schema": 1}, extracted)
+
+
 def test_forged_bounds_and_corrupt_source_are_rejected():
     blobs, sender = MemoryBlobs(), MemorySender()
     dispatch(blobs, sender, b"%PDF-1.7\nfixture", "report", 20)
