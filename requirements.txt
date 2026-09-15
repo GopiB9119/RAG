@@ -1,7 +1,8 @@
+pymupdf>=1.24,<2
+pytest>=8,<10
 chromadb
 beautifulsoup4
 openai
-pymupdf
 python-dotenv
 requests
 sentence-transformers

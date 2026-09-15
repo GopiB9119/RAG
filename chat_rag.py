@@ -5,10 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 
-import chromadb
-from sentence_transformers import SentenceTransformer
-
-from rag_core import DEFAULT_COLLECTION, DEFAULT_DATABASE, MODEL_NAME, answer_question
+from rag_core import DEFAULT_COLLECTION, DEFAULT_DATABASE, MODEL_NAME, answer_question, validate_collection
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +19,8 @@ def parse_args() -> argparse.Namespace:
 
 def load_collection(database: str, name: str):
     """Open an existing, non-empty collection or exit with a helpful message."""
+    import chromadb
+
     client = chromadb.PersistentClient(path=database)
     try:
         collection = client.get_collection(name=name)
@@ -31,6 +30,8 @@ def load_collection(database: str, name: str):
         ) from error
     if not collection.count():
         raise SystemExit("The collection is empty. Run ingest_sources.py first.")
+    validate_collection(collection)
+    # Refuse unknown embedding settings rather than silently searching mismatched vectors.
     return collection
 
 
@@ -39,10 +40,14 @@ def main() -> None:
     args = parse_args()
 
     collection = load_collection(args.database, args.collection)
+    from sentence_transformers import SentenceTransformer
+
     chunk_count = collection.count()
     print(f"Loaded {chunk_count} searchable chunks from '{args.collection}'.")
     print("Ask questions about the indexed sources. Type 'exit' to stop.")
 
+    # Load once per chat process, not once per question. This is the same embedding
+    # model used at indexing time; Azure is the separate answer-generation model.
     model = SentenceTransformer(MODEL_NAME)
     while True:
         try:
@@ -54,7 +59,11 @@ def main() -> None:
             print("Goodbye.")
             break
         if question:
-            answer_question(question, collection, model, chunk_count)
+            # Each question is currently independent: this CLI does not pass chat
+            # history or resolve follow-ups such as "what about the previous one?".
+            # The watcher can change the index after chat starts. Refresh the count
+            # rather than limiting later searches to the startup snapshot count.
+            answer_question(question, collection, model, collection.count())
 
 
 if __name__ == "__main__":

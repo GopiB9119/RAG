@@ -1,0 +1,15 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+COPY requirements-azure.txt ./
+RUN python -m pip install --no-cache-dir -r requirements-azure.txt \
+    && useradd --create-home --uid 10001 appuser
+
+COPY src/pdf_pipeline/ ./src/pdf_pipeline/
+COPY azure_pipeline.py ./
+USER appuser
+
+CMD ["python", "azure_pipeline.py", "worker"]
